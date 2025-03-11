@@ -8,6 +8,7 @@ import pandas as pd
 import tempfile
 import uuid
 import json
+from PIL import Image
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -70,7 +71,7 @@ def view_page(page_num):
 @app.route("/get_page_image/<int:page_num>")
 def get_page_image(page_num):
     if 'current_pdf_path' not in session:
-        return "No PDF loaded", 404
+        return None, "No PDF loaded"
     
     try:
         zoom = 1.5  # Adjust zoom for better quality
@@ -80,11 +81,12 @@ def get_page_image(page_num):
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-            return send_file(buf, mimetype="image/png")
+            return buf, None  # Returning image byte array and None as error
     except Exception as e:
-        return f"Error converting page: {str(e)}", 500
+        return None, f"Error converting page: {str(e)}"
     
-    return "No image", 404
+    return None, "No image available"
+
 
 # API to set scale
 @app.route("/api/set_scale", methods=["POST"])
@@ -153,50 +155,80 @@ def create_annotation():
     annotation_type = data.get('type')
     points = data.get('points', [])
     label = data.get('label', '')
-    
+
     if len(points) != 2 or not annotation_type:
         return jsonify({"success": False, "error": "Invalid data"}), 400
-    
-    # Get current page annotations
-    page_num = str(session['current_page_num'])
-    annotations = session.get('annotations', {})
-    
-    if page_num not in annotations:
-        annotations[page_num] = []
-    
-    # If it's a measurement annotation and scale is set, add dimensions
+
+    page_num = str(session.get('current_page_num', data.get("page_num")))
+
+    if "annotations" not in session:
+        session["annotations"] = {}
+
+    if page_num not in session["annotations"]:
+        session["annotations"][page_num] = []
+
+    # Get the image size
+    img_byte_arr, error = get_page_image(int(page_num))
+    if error:
+        return jsonify({"success": False, "error": error}), 400
+
+    img = Image.open(img_byte_arr)
+    img_width, img_height = img.size  # Get actual image dimensions
+
+    # Get the PDF page size
+    pdf_path = session.get("current_pdf_path", "")
+    if not pdf_path:
+        return jsonify({"success": False, "error": "PDF not loaded"}), 400
+
+    with fitz.open(pdf_path) as doc:
+        pdf_page = doc[int(page_num)]
+        pdf_width = pdf_page.rect.width  # Actual PDF width
+        pdf_height = pdf_page.rect.height  # Actual PDF height
+
+    # Calculate scaling factors
+    scale_x = pdf_width / img_width
+    scale_y = pdf_height / img_height
+
+    # Scale the annotation points
+    scaled_points = [[p[0] * scale_x, p[1] * scale_y] for p in points]
+
+    # Handle measurements if scale is set
     dimensions = None
-    if annotation_type == 'square' and session.get('scale'):
+    if annotation_type == "square" and session.get("scale"):
         p1, p2 = points
-        length = abs(p2[0] - p1[0]) * session['scale']
-        width = abs(p2[1] - p1[1]) * session['scale']
+        length = abs(p2[0] - p1[0]) * session["scale"]
+        width = abs(p2[1] - p1[1]) * session["scale"]
         dimensions = [length, width]
-        
-        # Add to Excel data
-        if data.get('rect_type') and data.get('rect_name'):
-            excel_data = session.get('data_for_excel', [])
+
+        # Add to Excel data if relevant
+        if data.get("rect_type") and data.get("rect_name"):
+            excel_data = session.get("data_for_excel", [])
             excel_data.append([
-                data.get('rect_type', 'Unknown'), 
-                data.get('rect_name', f"Item {len(excel_data) + 1}"),
-                length, 
-                width
+                data.get("rect_name", f"Item {len(excel_data) + 1}"),
+                data.get("parent_area", ""),
+                length,
+                width,
+                data.get("rect_height", 0),
+                data.get("replicas", 1),
+                data.get("unit", "units"),
+                data.get("rect_type", "Unknown")
+
+
             ])
-            session['data_for_excel'] = excel_data
-    
+            session["data_for_excel"] = excel_data
+
     # Store annotation
-    annotations[page_num].append({
-        'type': annotation_type,
-        'points': points,
-        'label': label,
-        'dimensions': dimensions
-    })
-    
-    session['annotations'] = annotations
-    
-    return jsonify({
-        "success": True, 
-        "message": f"Added {annotation_type} annotation"
-    })
+    annotation = {
+        "type": annotation_type,
+        "points": scaled_points,
+        "label": label,
+        "dimensions": dimensions
+    }
+
+    session["annotations"][page_num].append(annotation)
+
+    return jsonify({"success": True, "message": f"Added {annotation_type} annotation"})
+
 
 # API to clear annotations
 @app.route("/api/clear_annotations", methods=["POST"])
@@ -238,46 +270,39 @@ def save_pdf():
                 if anno.get('type') == 'scale_reference':
                     continue
                 
-                # Get points and convert to PDF coordinates
+                # Get points and use directly (they are already in PDF coordinates)
                 points = anno.get('points', [])
                 if len(points) != 2:
                     continue
                 
-                # Get original page dimensions
-                original_width = page.rect.width
-                original_height = page.rect.height
-                
-                # Get current display dimensions from session or use defaults
-                # This would normally come from the client's canvas size
-                display_width = 800  # This should match your canvas width
-                display_height = 1100  # This should match your canvas height
-                
-                # Calculate scale factors
-                scale_x = original_width / display_width
-                scale_y = original_height / display_height
-                
                 if anno.get('type') == 'line':
                     start, end = points
-                    # Convert to PDF coordinates
-                    pdf_start = (start[0] * scale_x, start[1] * scale_y)
-                    pdf_end = (end[0] * scale_x, end[1] * scale_y)
-                    
                     # Draw on PDF
-                    page.draw_line(pdf_start, pdf_end, color=(1, 0, 0), width=2)
-                    page.insert_text((pdf_start[0], pdf_start[1] - 10 * scale_y), 
+                    page.draw_line(start, end, color=(1, 0, 0), width=2)
+                    page.insert_text((start[0], start[1] - 10), 
                                    anno.get('label', ''), color=(0, 0, 1))
                 
                 elif anno.get('type') == 'square':
                     p1, p2 = points
-                    # Convert to PDF coordinates
-                    pdf_x1, pdf_y1 = p1[0] * scale_x, p1[1] * scale_y
-                    pdf_x2, pdf_y2 = p2[0] * scale_x, p2[1] * scale_y
                     
-                    # Draw on PDF
-                    rect = fitz.Rect(pdf_x1, pdf_y1, pdf_x2, pdf_y2)
-                    page.draw_rect(rect, color=(0, 1, 0), width=2)
-                    page.insert_text((pdf_x1, pdf_y1 - 10 * scale_y), 
-                                   anno.get('label', ''), color=(0, 0, 1))
+                    # Create rectangle with the two points
+                    x1, y1 = p1[0], p1[1]
+                    x2, y2 = p2[0], p2[1]
+                    
+                    # Ensure we have a proper rectangle by drawing all four sides individually
+                    # This makes sure we get a complete rectangle even if PyMuPDF's rect drawing has issues
+                    
+                    # Top line
+                    page.draw_line((x1, y1), (x2, y1), color=(0, 1, 0), width=2)
+                    # Right line
+                    page.draw_line((x2, y1), (x2, y2), color=(0, 1, 0), width=2)
+                    # Bottom line
+                    page.draw_line((x2, y2), (x1, y2), color=(0, 1, 0), width=2)
+                    # Left line
+                    page.draw_line((x1, y2), (x1, y1), color=(0, 1, 0), width=2)
+                    
+                    # Add label
+                    page.insert_text((x1, y1 - 10), anno.get('label', ''), color=(0, 0, 1))
         
         # Save to temporary file
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
@@ -296,7 +321,6 @@ def save_pdf():
     
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 # Download the saved PDF
 @app.route("/download/pdf/<filename>")
 def download_pdf(filename):
@@ -320,7 +344,7 @@ def save_excel():
     
     try:
         # Create DataFrame
-        df = pd.DataFrame(excel_data, columns=['Type', 'Name', 'Length', 'Width'])
+        df = pd.DataFrame(excel_data, columns=['Name', 'Parent Area', 'Drawing Length', 'Drawing Width','Drawing Height','Drawing Number Of Replicas','Unit','Area Type'])
         
         # Save to temporary file
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
