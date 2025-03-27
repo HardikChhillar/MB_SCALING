@@ -36,7 +36,10 @@ def index():
             session['annotations'] = {}
             session['scale'] = None
             session['data_for_excel'] = []
-            
+            session['original_scale'] = None
+            session['zoom_level'] = 1.5
+            session['undo_stack'] = {}
+
             return redirect(url_for("view_page", page_num=0))
     return render_template_string(HOME_TEMPLATE)
 
@@ -62,7 +65,8 @@ def view_page(page_num):
             page_num=page_num,
             total_pages=total_pages,
             has_scale=session.get('scale') is not None,
-            annotations=session.get('annotations', {}).get(str(page_num), [])
+            annotations=session.get('annotations', {}).get(str(page_num), []),
+            zoom_level=session.get('zoom_level', 1.5)
         )
     except Exception as e:
         return f"Error loading PDF: {str(e)}", 500
@@ -74,7 +78,7 @@ def get_page_image(page_num):
         return None, "No PDF loaded"
     
     try:
-        zoom = 1.5  # Adjust zoom for better quality
+        zoom = session.get('zoom_level',1.5)  # Adjust zoom for better quality
         pages = convert_from_path(session['current_pdf_path'], first_page=page_num+1, last_page=page_num+1, dpi=72*zoom)
         if pages:
             img = pages[0]
@@ -86,6 +90,45 @@ def get_page_image(page_num):
         return None, f"Error converting page: {str(e)}"
     
     return None, "No image available"
+
+# Updated Adjust Zoom API
+@app.route("/api/adjust_zoom", methods=["POST"])
+def adjust_zoom():
+    data = request.json
+    zoom_action = data.get('action')
+    
+    current_zoom = session.get('zoom_level', 1.5)
+    current_scale = session.get('scale')
+    original_scale = session.get('original_scale')
+    
+    if zoom_action == 'in':
+        new_zoom = min(current_zoom * 1.2, 3.0)  # Max zoom of 3x
+    elif zoom_action == 'out':
+        new_zoom = max(current_zoom / 1.2, 0.5)  # Min zoom of 0.5x
+    else:
+        return jsonify({"success": False, "error": "Invalid zoom action"}), 400
+    
+    # Preserve scale proportionality
+    if current_scale is not None:
+        # If no original scale stored, store the current scale
+        if original_scale is None:
+            session['original_scale'] = current_scale
+            original_zoom = session.get('zoom_level', 1.5)
+        else:
+            original_zoom = session.get('zoom_level', 1.5)
+        
+        # Adjust scale proportionally to zoom change
+        new_scale = original_scale * (original_zoom / new_zoom)
+        session['scale'] = new_scale
+    
+    session['zoom_level'] = new_zoom
+    
+    return jsonify({
+        "success": True, 
+        "zoom_level": new_zoom,
+        "scale": session.get('scale'),
+        "message": f"Zoom set to {new_zoom:.2f}"
+    })
 
 
 # API to set scale
@@ -148,7 +191,6 @@ def reset_scale():
     
     return jsonify({"success": True, "message": "Scale has been reset"})
 
-# API to create annotation
 @app.route("/api/create_annotation", methods=["POST"])
 def create_annotation():
     data = request.json
@@ -166,6 +208,10 @@ def create_annotation():
 
     if page_num not in session["annotations"]:
         session["annotations"][page_num] = []
+
+    # Track undo stack
+    if page_num not in session["undo_stack"]:
+        session["undo_stack"][page_num] = []
 
     # Get the image size
     img_byte_arr, error = get_page_image(int(page_num))
@@ -192,43 +238,92 @@ def create_annotation():
     # Scale the annotation points
     scaled_points = [[p[0] * scale_x, p[1] * scale_y] for p in points]
 
-    # Handle measurements if scale is set
-    dimensions = None
-    if annotation_type == "square" and session.get("scale"):
-        p1, p2 = points
-        length = abs(p2[0] - p1[0]) * session["scale"]
-        width = abs(p2[1] - p1[1]) * session["scale"]
-        dimensions = [length, width]
+    # Categorize activity type
+    rect_type = data.get("rect_type", "").lower()
+    line_activities = ['wall', 'door', 'window', 'panel']
+    area_activities = ['floor', 'ceiling', 'pillar']
+    
+    is_line_activity = rect_type in line_activities
+    is_area_activity = rect_type in area_activities
 
-        # Add to Excel data if relevant
-        if data.get("rect_type") and data.get("rect_name"):
-            excel_data = session.get("data_for_excel", [])
-            excel_data.append([
-                data.get("rect_name", f"Item {len(excel_data) + 1}"),
-                data.get("parent_area", ""),
-                length,
-                width,
-                data.get("rect_height", 0),
-                data.get("replicas", 1),
-                data.get("unit", "units"),
-                data.get("rect_type", "Unknown")
+    # Calculate dimensions
+    p1, p2 = points
+    width = abs(p2[0] - p1[0]) * session.get("scale", 1)
+    height = abs(p2[1] - p1[1]) * session.get("scale", 1)
+   
+    # For line activities, calculate total length
+    if is_line_activity:
+        length = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2) * session.get("scale", 1)
+        width = length  # Set width to total length
+        height = 0  # No height for line activities
+        plan_height=0
+        unit = "RMT"  # Running meter
+    else:
+        plan_height=0
+        unit = "Sqmt"  # Square meter
 
-
-            ])
-            session["data_for_excel"] = excel_data
+    # Add to Excel data
+    excel_data = session.get("data_for_excel", [])
+    excel_data.append([
+        data.get("rect_name", f"Item {len(excel_data) + 1}"),
+        data.get("parent_area", ""),
+        width,
+        height,
+        plan_height,
+        data.get("replicas", 1),
+        unit,
+        data.get("rect_type", "Unknown")
+    ])
+    session["data_for_excel"] = excel_data
 
     # Store annotation
     annotation = {
         "type": annotation_type,
         "points": scaled_points,
         "label": label,
-        "dimensions": dimensions
+        "dimensions": [width, height]
     }
 
     session["annotations"][page_num].append(annotation)
+    session["undo_stack"][page_num].append(annotation)
 
     return jsonify({"success": True, "message": f"Added {annotation_type} annotation"})
-
+# API to undo last annotation
+@app.route("/api/undo_annotation", methods=["POST"])
+def undo_annotation():
+    page_num = str(session.get('current_page_num'))
+    
+    # Check if there are annotations to undo
+    annotations = session.get('annotations', {}).get(page_num, [])
+    undo_stack = session.get('undo_stack', {}).get(page_num, [])
+    excel_data = session.get('data_for_excel', [])
+    
+    if not annotations or not undo_stack:
+        return jsonify({"success": False, "message": "No annotations to undo"})
+    
+    # Remove last annotation
+    last_annotation = annotations.pop()
+    
+    # Ensure the undo stack is updated
+    if undo_stack and undo_stack[-1] == last_annotation:
+        undo_stack.pop()
+    
+    # Remove the corresponding Excel data entry
+    # This assumes the Excel data is added in the same order as annotations
+    if excel_data:
+        excel_data.pop()
+    
+    # Update session
+    session['annotations'][page_num] = annotations
+    session['undo_stack'][page_num] = undo_stack
+    session['data_for_excel'] = excel_data
+    
+    return jsonify({
+        "success": True, 
+        "message": "Last annotation removed",
+        "remaining_annotations": len(annotations),
+        "remaining_excel_entries": len(excel_data)
+    })
 
 # API to clear annotations
 @app.route("/api/clear_annotations", methods=["POST"])
@@ -264,8 +359,14 @@ def save_pdf():
         for page_num_str, page_annotations in annotations.items():
             page_num = int(page_num_str)
             page = doc[page_num]
+          
+                 # Filter out scale references and keep only meaningful annotations
+            filtered_annotations = [
+                anno for anno in page_annotations 
+                if anno.get('type') != 'scale_reference'
+            ]
             
-            for anno in page_annotations:
+            for anno in filtered_annotations:
                 # Skip scale reference
                 if anno.get('type') == 'scale_reference':
                     continue
@@ -363,6 +464,19 @@ def save_excel():
     
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+    
+# Add a new route to get data preview
+@app.route("/api/get_data_preview", methods=["GET"])
+def get_data_preview():
+    excel_data = session.get('data_for_excel', [])
+    
+    if not excel_data:
+        return jsonify({"success": False, "message": "No data available"})
+    
+    return jsonify({
+        "success": True, 
+        "data": excel_data
+    })
 
 # Download the saved Excel file
 @app.route("/download/excel/<filename>")
@@ -461,6 +575,37 @@ VIEW_PAGE_TEMPLATE = """
     .input-group label { display: block; margin-bottom: 5px; }
     .input-group input { width: 100%; padding: 8px; }
     .modal-buttons { display: flex; justify-content: flex-end; gap: 10px; }
+     #data-preview-modal {
+      display: none;
+      position: fixed;
+      z-index: 100;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0,0,0,0.4);
+    }
+    #data-preview-content {
+      background-color: white;
+      margin: 10% auto;
+      padding: 20px;
+      border: 1px solid #888;
+      width: 80%;
+      max-height: 70%;
+      overflow-y: auto;
+    }
+    #data-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    #data-table th, #data-table td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+    #data-table th {
+      background-color: #f2f2f2;
+    }
   </style>
 </head>
 <body>
@@ -477,12 +622,16 @@ VIEW_PAGE_TEMPLATE = """
         </button>
       </div>
       <div class="button-group">
+        <button id="zoom-in-btn" class="btn btn-secondary">Zoom In</button>
+        <button id="zoom-out-btn" class="btn btn-secondary">Zoom Out</button>
+        <button id="undo-btn" class="btn btn-secondary">Undo Last</button>
         <button id="set-scale-btn" class="btn btn-primary">Set Scale</button>
         <button id="reset-scale-btn" class="btn btn-warning" {% if not has_scale %}disabled{% endif %}>Reset Scale</button>
         <button id="measure-btn" class="btn btn-primary" {% if not has_scale %}disabled{% endif %}>Add Measurement</button>
         <button id="clear-btn" class="btn btn-danger">Clear Annotations</button>
       </div>
       <div class="button-group">
+        <button id="preview-data-btn" class="btn btn-secondary">Preview Data</button>
         <button id="save-pdf-btn" class="btn btn-primary">Save PDF</button>
         <button id="save-excel-btn" class="btn btn-primary">Save Data to Excel</button>
       </div>
@@ -509,7 +658,36 @@ VIEW_PAGE_TEMPLATE = """
       </div>
     </div>
   </div>
-  
+
+  <!-- [Previous HTML remains the same] -->
+    
+    <!-- Data Preview Modal -->
+    <div id="data-preview-modal">
+      <div id="data-preview-content">
+        <h3>Current Measurement Data</h3>
+        <table id="data-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Parent Area</th>
+              <th>Drawing Length</th>
+              <th>Drawing Width</th>
+              <th>Drawing Height</th>
+              <th>Drawing Number Of Replicas</th>
+              <th>Unit</th>
+              <th>Area Type</th>
+            </tr>
+          </thead>
+          <tbody id="data-table-body">
+            <!-- Data rows will be dynamically populated -->
+          </tbody>
+        </table>
+        <div style="margin-top: 15px; text-align: right;">
+          <button id="close-preview-btn" class="btn btn-secondary">Close</button>
+        </div>
+      </div>
+    </div>
+
   <!-- Measurement Modal -->
   <div id="measure-modal" class="modal">
     <div class="modal-content">
@@ -522,7 +700,12 @@ VIEW_PAGE_TEMPLATE = """
         <label for="rect-name">Name:</label>
         <input type="text" id="rect-name" placeholder="Name">
       </div>
-      <div id="dimensions-display"></div>
+      <!-- New section to display measurements -->
+      <div id="measurements-preview" class="input-group">
+        <label>Measurements:</label>
+        <p id="pixel-length-display"></p>
+        <p id="original-length-display"></p>
+      </div>
       <div class="modal-buttons">
         <button id="cancel-measure-btn" class="btn btn-secondary">Cancel</button>
         <button id="confirm-measure-btn" class="btn btn-primary">Add</button>
@@ -531,14 +714,142 @@ VIEW_PAGE_TEMPLATE = """
   </div>
 
   <script>
-    // Global variables
+     // Global variables
     const canvas = document.getElementById('pdfCanvas');
     const ctx = canvas.getContext('2d');
     let points = [];
     let currentAction = null;
     let imageObj = null;
     let annotations = {{ annotations|tojson|safe }};
-    
+    // Preview Data Button Handler
+    document.getElementById('preview-data-btn').addEventListener('click', async () => {
+      try {
+        const response = await fetch('/api/get_data_preview', {
+          method: 'GET',
+          headers: {'Content-Type': 'application/json'}
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+          const tableBody = document.getElementById('data-table-body');
+          tableBody.innerHTML = ''; // Clear previous data
+          
+          result.data.forEach(row => {
+            const tr = document.createElement('tr');
+            row.forEach(cell => {
+              const td = document.createElement('td');
+              td.textContent = cell;
+              tr.appendChild(td);
+            });
+            tableBody.appendChild(tr);
+          });
+          
+          document.getElementById('data-preview-modal').style.display = 'block';
+        } else {
+          updateStatus('No data available');
+        }
+      } catch (error) {
+        console.error('Error previewing data:', error);
+        updateStatus('Error retrieving data');
+      }
+    });
+
+    // Close Preview Modal
+    document.getElementById('close-preview-btn').addEventListener('click', () => {
+      document.getElementById('data-preview-modal').style.display = 'none';
+    });
+
+    // Updated Zoom controls
+    document.getElementById('zoom-in-btn').addEventListener('click', async () => {
+       try {
+        const response = await fetch('/api/adjust_zoom', {
+         method: 'POST',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({ action: 'in' })
+        });
+        const result = await response.json();
+        if (result.success) {
+          updateStatus(`Zoomed in. Current zoom: ${result.zoom_level.toFixed(2)}`);
+          // Reload the page image with new zoom
+          location.reload();
+        }
+      } catch (error) {
+        console.error('Zoom in error:', error);
+        updateStatus('Error zooming in');
+      }
+    });
+
+    document.getElementById('zoom-out-btn').addEventListener('click', async () => {
+       try {
+        const response = await fetch('/api/adjust_zoom', {
+         method: 'POST',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({ action: 'out' })
+        });
+        const result = await response.json();
+        if (result.success) {
+          updateStatus(`Zoomed out. Current zoom: ${result.zoom_level.toFixed(2)}`);
+          // Reload the page image with new zoom
+          location.reload();
+        }
+      } catch (error) {
+        console.error('Zoom out error:', error);
+        updateStatus('Error zooming out');
+      }
+    });
+      // Adjust zoom handler to preserve state
+    async function adjustZoom(action) {
+      try {
+        const response = await fetch('/api/adjust_zoom', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ action: action })
+        });
+        const result = await response.json();
+        if (result.success) {
+          // Preserve important session variables
+          const currentScale = result.scale;
+          const currentZoom = result.zoom_level;
+          
+          updateStatus(`Zoomed ${action}. Current zoom: ${currentZoom.toFixed(2)}`);
+          
+          // Reload the page, ensuring state is preserved
+          window.location.reload();
+        }
+      } catch (error) {
+        console.error(`Zoom ${action} error:`, error);
+        updateStatus(`Error zooming ${action}`);
+      }
+    }
+
+    // Update zoom button event listeners
+    document.getElementById('zoom-in-btn').addEventListener('click', () => adjustZoom('in'));
+    document.getElementById('zoom-out-btn').addEventListener('click', () => adjustZoom('out'));
+
+     // Undo button handler
+     document.getElementById('undo-btn').addEventListener('click', async () => {
+       try {
+         const response = await fetch('/api/undo_annotation', {
+         method: 'POST',
+         headers: {'Content-Type': 'application/json'}
+        });
+         const result = await response.json();
+         if (result.success) {
+          updateStatus(result.message);
+          // Remove last annotation from local annotations array
+          if (annotations.length > 0) {
+            annotations.pop();
+          }
+          redrawCanvas();
+        } else {
+          updateStatus(result.message);
+        }
+      } catch (error) {
+        console.error('Undo error:', error);
+        updateStatus('Error undoing last annotation');
+      }
+    });
+
     // Navigation buttons
     document.getElementById('prev-btn').addEventListener('click', () => {
       window.location.href = "{{ url_for('view_page', page_num=page_num-1) }}";
@@ -702,50 +1013,116 @@ VIEW_PAGE_TEMPLATE = """
       redrawCanvas();
     });
     
-    // Measurement modal handlers
-    document.getElementById('confirm-measure-btn').addEventListener('click', async () => {
-      const rectType = document.getElementById('rect-type').value || 'Unknown';
-      const rectName = document.getElementById('rect-name').value || 'Item ' + (annotations.length + 1);
-      
-      try {
-        // Calculate dimensions for display
-        const p1 = points[0];
-        const p2 = points[1];
-        const width = Math.abs(p2[0] - p1[0]);
-        const height = Math.abs(p2[1] - p1[1]);
-        
-        const response = await fetch('/api/create_annotation', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            type: 'square',
-            points: points,
-            label: `${rectName} (${rectType}: ${width}x${height})`,
-            rect_type: rectType,
-            rect_name: rectName
-          })
-        });
-        
-        const result = await response.json();
-        if (result.success) {
-          updateStatus(result.message);
-          
-          // Add annotation locally
-          annotations.push({
-            type: 'square',
-            points: points,
-            label: `${rectName} (${rectType}: ${width}x${height})`
-          });
-          
-          hideModal('measure-modal');
-          points = [];
-          currentAction = null;
-          redrawCanvas();
-        }
-      } catch (error) {
-        console.error('Error creating annotation:', error);
-      }
+    // Function to categorize activity type
+function categorizeActivityType(type) {
+  // Convert to lowercase for case-insensitive comparison
+  const lowercaseType = type.toLowerCase();
+  
+  // Line-based activities
+  const lineActivities = ['wall', 'door', 'window', 'panel'];
+  
+  // Area-based activities
+  const areaActivities = ['floor', 'ceiling', 'pillar'];
+  
+  if (lineActivities.includes(lowercaseType)) {
+    return 'line';
+  } else if (areaActivities.includes(lowercaseType)) {
+    return 'area';
+  }
+  
+  // Default to area if not recognized
+  return 'area';
+}
+
+// Modify the confirm measure button event listener
+document.getElementById('confirm-measure-btn').addEventListener('click', async () => {
+  const rectType = document.getElementById('rect-type').value || 'Unknown';
+  const rectName = document.getElementById('rect-name').value || `Item ${annotations.length + 1}`;
+  
+  // Categorize activity type
+  const activityCategory = categorizeActivityType(rectType);
+  
+  try {
+    const p1 = points[0];
+    const p2 = points[1];
+    const width = Math.abs(p2[0] - p1[0]);
+    const height = Math.abs(p2[1] - p1[1]);
+    
+    // Calculate length based on canvas points
+    const length = activityCategory === 'line' 
+      ? Math.sqrt(width * width + height * height)  // Diagonal length for line
+      : width;  // For area, use width as length
+    
+    const response = await fetch('/api/create_annotation', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        type: 'square',
+        points: points,
+        label: `${rectName} (${rectType})`,
+        rect_type: rectType,
+        rect_name: rectName,
+        rect_height: activityCategory === 'area' ? height : 0,
+        parent_area: '',
+        replicas: 1,
+        unit: activityCategory === 'line' ? 'running meter' : 'square meter'
+      })
     });
+    
+    const result = await response.json();
+    if (result.success) {
+      updateStatus(result.message);
+      
+      // Modify label to show appropriate measurements
+      let annotationLabel = `${rectName} (${rectType})`;
+      if (activityCategory === 'line') {
+        annotationLabel += ` - Length: ${(length.toFixed(2))} running meters`;
+      } else {
+        annotationLabel += ` - ${(width.toFixed(2))} x ${(height.toFixed(2))} square meters`;
+      }
+      
+      // Add annotation locally
+      annotations.push({
+        type: 'square',
+        points: points,
+        label: annotationLabel
+      });
+      
+      hideModal('measure-modal');
+      points = [];
+      currentAction = null;
+      redrawCanvas();
+    }
+  } catch (error) {
+    console.error('Error creating annotation:', error);
+    updateStatus('Error creating annotation');
+  }
+});
+
+// Modify the measurements preview to show different info based on activity type
+document.getElementById('confirm-measure-btn').addEventListener('click', () => {
+  const rectType = document.getElementById('rect-type').value || 'Unknown';
+  const activityCategory = categorizeActivityType(rectType);
+  
+  const p1 = points[0];
+  const p2 = points[1];
+  const width = Math.abs(p2[0] - p1[0]);
+  const height = Math.abs(p2[1] - p1[1]);
+  
+  const pixelLengthDisplay = document.getElementById('pixel-length-display');
+  const originalLengthDisplay = document.getElementById('original-length-display');
+  
+  if (activityCategory === 'line') {
+    // For line, show total length
+    const length = Math.sqrt(width * width + height * height);
+    pixelLengthDisplay.textContent = `Total Length (Pixels): ${length.toFixed(2)} pixels`;
+    originalLengthDisplay.textContent = 'Length will be in running meters';
+  } else {
+    // For area, show width and height
+    pixelLengthDisplay.textContent = `Pixel Dimensions: ${width.toFixed(2)} x ${height.toFixed(2)} pixels`;
+    originalLengthDisplay.textContent = 'Dimensions will be in square meters';
+  }
+});
     
     document.getElementById('cancel-measure-btn').addEventListener('click', () => {
       hideModal('measure-modal');
@@ -754,7 +1131,7 @@ VIEW_PAGE_TEMPLATE = """
       redrawCanvas();
     });
     
-    // Canvas click handler
+    // Update canvas click handler
     canvas.addEventListener('click', (event) => {
       if (!currentAction) return;
       
@@ -776,14 +1153,15 @@ VIEW_PAGE_TEMPLATE = """
         if (currentAction === 'setScale') {
           showModal('scale-modal');
         } else if (currentAction === 'measure') {
-          // Calculate dimensions for display
+          // Show measure modal and pre-populate dimensions
           const p1 = points[0];
           const p2 = points[1];
           const width = Math.abs(p2[0] - p1[0]);
           const height = Math.abs(p2[1] - p1[1]);
           
-          document.getElementById('dimensions-display').textContent = 
-            `Dimensions: ${width.toFixed(2)} x ${height.toFixed(2)} pixels`;
+          // Update modal display
+          document.getElementById('pixel-length-display').textContent = 
+            `Pixel Dimensions: ${width.toFixed(2)} x ${height.toFixed(2)} pixels`;
           
           showModal('measure-modal');
         }
