@@ -267,8 +267,8 @@ def create_annotation():
     excel_data.append([
         data.get("rect_name", f"Item {len(excel_data) + 1}"),
         data.get("parent_area", ""),
-        width,
-        height,
+        round(width,3),
+        round(height,3),
         plan_height,
         data.get("replicas", 1),
         unit,
