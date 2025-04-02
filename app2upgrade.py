@@ -9,6 +9,10 @@ import tempfile
 import uuid
 import json
 from PIL import Image
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -345,74 +349,72 @@ def clear_annotations():
     return jsonify({"success": True, "message": "No annotations to clear"})
 
 # Export annotations to PDF
+def adjust_coordinates(x, y, width, height, page_rotation, page_width, page_height):
+    if page_rotation == 90:
+        return y, page_width - x, width, height
+    elif page_rotation == 180:
+        return page_width - x, page_height - y, width, height
+    elif page_rotation == 270:
+        return page_height - y, x, width, height
+    return x, y, width, height
+
 @app.route("/api/save_pdf", methods=["POST"])
 def save_pdf():
+    logging.info("Received request to save PDF annotations")
     if 'current_pdf_path' not in session:
+        logging.warning("No PDF loaded in session")
         return jsonify({"success": False, "error": "No PDF loaded"}), 400
     
     try:
-        # Open the PDF
         doc = fitz.open(session['current_pdf_path'])
         annotations = session.get('annotations', {})
         
-        # Apply annotations to PDF
         for page_num_str, page_annotations in annotations.items():
             page_num = int(page_num_str)
             page = doc[page_num]
-          
-                 # Filter out scale references and keep only meaningful annotations
+            page_rotation = page.rotation
+            page_width, page_height = page.rect.width, page.rect.height
+            
             filtered_annotations = [
                 anno for anno in page_annotations 
                 if anno.get('type') != 'scale_reference'
             ]
             
             for anno in filtered_annotations:
-                # Skip scale reference
-                if anno.get('type') == 'scale_reference':
-                    continue
-                
-                # Get points and use directly (they are already in PDF coordinates)
                 points = anno.get('points', [])
                 if len(points) != 2:
+                    logging.warning(f"Skipping annotation with invalid points: {anno}")
                     continue
                 
                 if anno.get('type') == 'line':
                     start, end = points
-                    # Draw on PDF
+                    start = adjust_coordinates(start[0], start[1], 0, 0, page_rotation, page_width, page_height)[:2]
+                    end = adjust_coordinates(end[0], end[1], 0, 0, page_rotation, page_width, page_height)[:2]
                     page.draw_line(start, end, color=(1, 0, 0), width=2)
                     page.insert_text((start[0], start[1] - 10), 
                                    anno.get('label', ''), color=(0, 0, 1))
+                    logging.info(f"Drew line annotation: {anno}")
                 
                 elif anno.get('type') == 'square':
                     p1, p2 = points
+                    x1, y1, _, _ = adjust_coordinates(p1[0], p1[1], 0, 0, page_rotation, page_width, page_height)
+                    x2, y2, _, _ = adjust_coordinates(p2[0], p2[1], 0, 0, page_rotation, page_width, page_height)
                     
-                    # Create rectangle with the two points
-                    x1, y1 = p1[0], p1[1]
-                    x2, y2 = p2[0], p2[1]
-                    
-                    # Ensure we have a proper rectangle by drawing all four sides individually
-                    # This makes sure we get a complete rectangle even if PyMuPDF's rect drawing has issues
-                    
-                    # Top line
                     page.draw_line((x1, y1), (x2, y1), color=(0, 1, 0), width=2)
-                    # Right line
                     page.draw_line((x2, y1), (x2, y2), color=(0, 1, 0), width=2)
-                    # Bottom line
                     page.draw_line((x2, y2), (x1, y2), color=(0, 1, 0), width=2)
-                    # Left line
                     page.draw_line((x1, y2), (x1, y1), color=(0, 1, 0), width=2)
-                    
-                    # Add label
                     page.insert_text((x1, y1 - 10), anno.get('label', ''), color=(0, 0, 1))
+                    logging.info(f"Drew square annotation: {anno}")
         
-        # Save to temporary file
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
         doc.save(temp_file.name)
         temp_file.close()
         
-        # Return temporary file path to client for download
         temp_filename = os.path.basename(temp_file.name)
         session['temp_pdf'] = temp_file.name
+        
+        logging.info(f"Saved annotated PDF as {temp_filename}")
         
         return jsonify({
             "success": True, 
@@ -421,6 +423,7 @@ def save_pdf():
         })
     
     except Exception as e:
+        logging.error(f"Error while saving PDF: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
 # Download the saved PDF
 @app.route("/download/pdf/<filename>")
